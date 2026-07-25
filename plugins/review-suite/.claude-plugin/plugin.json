@@ -1,6 +1,6 @@
 {
   "name": "review-suite",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Bundled review and diagram playgrounds: /plan-review, /design-review, /architecture-map, /code-diagram, and a standalone /devserver launcher. Single install replacing the four prior xmandeng-plugins entries; one shared devserver binary with PTY bridge for session-resumed feedback delivery.",
   "author": {
     "name": "xmandeng",

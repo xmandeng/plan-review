@@ -77,10 +77,11 @@ def resolve_safe_layouts_target(raw_path: str, spawn_cwd: str) -> Path | None:
 # Playground session bridge — each playground HTML embeds a CLAUDE_SESSION (the
 # authoring session). On first WS connect the bridge forks a live `claude` child
 # from it and keeps that child alive across reloads, keyed by the playground HTML
-# path. Interactive forks never flush a resumable transcript to disk, so there is
-# no fork state to persist or re-attach to: continuity is the live process, and a
-# cold start (first open, devserver restart, idle reap) simply re-forks from
-# CLAUDE_SESSION.
+# path. Continuity across browser reloads is that live process, and a cold start
+# (first open, devserver restart, idle reap) re-forks from CLAUDE_SESSION rather
+# than resuming the previous fork. The fork does write its own transcript, so the
+# conversation held in a playground stays recoverable from a terminal by its own
+# session id, which is what the handoff button hands over.
 # =============================================================================
 
 # HTML basename suffixes the three review-suite skills produce. We accept the
@@ -302,8 +303,9 @@ def _pty_spawn(argv, cwd, env, dimensions=(40, 120)):
 # =============================================================================
 # Keep one live `claude` child per playground, across WebSocket reconnects, so a
 # browser reload reattaches to the SAME conversation instead of killing it and
-# starting over. Forked sessions never flush a resumable transcript to disk, so
-# reattach is by live process (held here), not by `claude --resume`.
+# starting over. Reattach is by live process (held here) rather than by
+# `claude --resume`, which would replay a transcript instead of rejoining the
+# running conversation.
 
 _SESSION_BUFFER_MAX = 256 * 1024      # replay buffer kept per session (bytes)
 _SESSION_IDLE_REAP_SECONDS = 3600     # reap a client-less session after this long
@@ -454,13 +456,12 @@ def _cold_start_spawn(
 ) -> tuple[list[str], str, str] | None:
     """Decide the argv for a brand-new playground process: always fork.
 
-    An interactive forked `claude` writes no resumable transcript to disk --
-    not after a turn, not on a clean exit (verified empirically; only print
-    mode `-p` flushes one). So there is never a stored fork id worth resuming,
-    and we do not try. The live child held in ``_sessions`` is what carries the
-    conversation across browser reloads. A cold start -- first open, devserver
-    restart, or a reaped idle session -- re-forks from the authoring session to
-    re-inherit the plan context.
+    The live child held in ``_sessions`` is what carries the conversation across
+    browser reloads. A cold start -- first open, devserver restart, or a reaped
+    idle session -- re-forks from the authoring session to re-inherit the plan
+    context, rather than resuming whatever fork ran before it. Re-forking keeps a
+    cold start deterministic: it always begins from the plan as authored, not from
+    wherever a previous playground conversation happened to end up.
 
     The authoring session is resumable (a normal, non-forked session flushes
     incrementally), so we fork from it and only bail with an error frame if even
@@ -545,8 +546,7 @@ def bridge_ws_to_claude_pty(
     the next connection re-binds to the same process and replays the recent
     output buffer, so the conversation survives reloads unbroken. The child is
     forked from the authoring session only on the FIRST open (to inherit the
-    plan context); reloads never re-fork or `--resume`, so they don't depend on
-    the forked transcript ever landing on disk.
+    plan context); reloads never re-fork or `--resume`.
 
     Wire protocol:
       - BINARY frames in both directions carry raw PTY bytes (terminal I/O).
@@ -588,6 +588,13 @@ def bridge_ws_to_claude_pty(
             args, active_sid, spawn_mode = spawn
             env = os.environ.copy()
             env.setdefault("TERM", "xterm-256color")
+            # A claude process that sees CLAUDE_CODE_CHILD_SESSION in its
+            # environment disables transcript saving for itself and prints a
+            # banner saying so. The devserver inherits that marker whenever it
+            # was launched from inside a Claude Code tool call, and passing it
+            # down would leave the playground conversation unwritten to disk.
+            # Drop it so the child flushes a transcript like any other session.
+            env.pop("CLAUDE_CODE_CHILD_SESSION", None)
             try:
                 proc = _pty_spawn(args, cwd=cwd, env=env)
             except Exception as exc:
@@ -608,9 +615,12 @@ def bridge_ws_to_claude_pty(
     # Announce the active session so the UI can show the right SID. A reused
     # session is reported as "attach" -- the client treats it as a reconnect.
     # `handoff` is the resumable id the terminal-handoff button must copy. The
-    # live fork never flushes a resumable transcript, so the only id a separate
-    # `claude --resume` can actually open is the authoring session.
-    handoff_sid = session_id
+    # forked child flushes its own transcript, so handing off its id resumes the
+    # conversation held in the playground rather than restarting from the plan as
+    # the authoring session was left. Fall back to the authoring session if the
+    # fork has not written a transcript yet, which is the case before its first
+    # turn completes.
+    handoff_sid = sess.active_sid if transcript_exists(sess.active_sid, cwd) else session_id
     try:
         ws_send_frame(
             sock,
